@@ -69,27 +69,15 @@ class ClusteringModel(nn.Module):
         return out
 
 class ScanMixModel(nn.Module):
-    def __init__(self, backbone, nclusters, nheads=2, setup=None, proj_dim=128):
+    def __init__(self, backbone, nclusters, nheads=2, setup=None):
         super(ScanMixModel, self).__init__()
         self.backbone = backbone['backbone']
         self.backbone_dim = backbone['dim']
         self.nheads = nheads
         self.setup = setup
-        self.proj_dim = proj_dim
         assert(isinstance(self.nheads, int))
         self.dm_head = nn.Linear(self.backbone_dim, nclusters)
         self.sl_head = nn.Linear(self.backbone_dim, nclusters)
-        
-        # ========== 投影头：解耦原型对比损失与MixUp梯度 ==========
-        # MLP: backbone_dim -> 256 -> proj_dim (默认128)
-        # 原型对比损失(L_proto)和邻居一致性损失(L_neighbor)在投影空间计算
-        # MixUp/DM损失在backbone->dm_head路径计算，两者梯度不再冲突
-        self.proj_head = nn.Sequential(
-            nn.Linear(self.backbone_dim, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, proj_dim)
-        )
 
     def forward(self, x, forward_pass='default'):
         if forward_pass == 'default':
@@ -100,30 +88,6 @@ class ScanMixModel(nn.Module):
 
         elif forward_pass == 'backbone':
             out = self.backbone(x)
-            return out
-
-        elif forward_pass == 'proj':
-            # 投影空间特征（用于原型对比损失）
-            features = self.backbone(x)
-            proj = self.proj_head(features)
-            return proj
-
-        elif forward_pass == 'backbone_and_proj':
-            # 同时返回backbone特征和投影特征（减少重复前向传播）
-            features = self.backbone(x)
-            proj = self.proj_head(features)
-            return features, proj
-
-        elif forward_pass == 'dm_and_proj':
-            # 同时返回dm输出和投影特征（单次backbone前向，用于eval_train_2dgmm）
-            features = self.backbone(x)
-            dm_out = self.dm_head(features)
-            proj_out = self.proj_head(features)
-            return dm_out, proj_out
-
-        elif forward_pass == 'proj_head':
-            # 仅过投影头（输入已是backbone特征）
-            out = self.proj_head(x)
             return out
 
         elif forward_pass == 'head':

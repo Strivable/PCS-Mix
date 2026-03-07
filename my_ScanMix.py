@@ -108,28 +108,27 @@ def eval_train_2dgmm(net, eval_loader, prototype_manager, device, tau=0.1, use_o
         # 处理不同的数据格式
         if isinstance(batch, dict):
             # 字典格式：{'image': ..., 'target': ..., 'meta': {'index': ...}}
-            inputs = batch['image'].to(device, non_blocking=True)
-            targets = batch['target'].to(device, non_blocking=True)
+            inputs = batch['image'].to(device)
+            targets = batch['target'].to(device)
             index = batch['meta']['index']
         elif isinstance(batch, (tuple, list)):
             # 元组格式：(img, target, index)
-            inputs = batch[0].to(device, non_blocking=True)
-            targets = batch[1].to(device, non_blocking=True)
+            inputs = batch[0].to(device)
+            targets = batch[1].to(device)
             index = batch[2]
         else:
             raise ValueError(f'Unsupported batch type: {type(batch)}')
         
-        # 1+2. 分类损失 + 投影特征（单次前向传播，共享backbone）
-        with torch.amp.autocast('cuda'):
-            outputs, proj_features = net(inputs, forward_pass='dm_and_proj')
-        # autocast 输出为 FP16，后续 mm 操作需 FP32
-        outputs = outputs.float()
-        proj_features = proj_features.float()
+        # 1. 计算分类损失 l_cls
+        outputs = net(inputs, forward_pass='dm')
         _, predicted = torch.max(outputs, 1)
         loss_cls = criterion(outputs, targets)
         
-        # 归一化（投影空间特征）
-        features_norm = F.normalize(proj_features, dim=1)
+        # 2. 计算原型距离损失 l_proto
+        features = net(inputs, forward_pass='backbone')
+        
+        # 归一化
+        features_norm = F.normalize(features, dim=1)
         prototypes_norm = F.normalize(prototype_manager.prototypes, dim=1)
         
         # 计算相似度（相似度越高，距离越小）
@@ -140,17 +139,21 @@ def eval_train_2dgmm(net, eval_loader, prototype_manager, device, tau=0.1, use_o
             # 使用真实标签对应的原型
             labels_for_proto = torch.tensor([true_labels_tensor[idx].item() for idx in index], device=device)
         else:
-            # 标准模式：使用预测标签
-            labels_for_proto = targets # predicted
+            # 标准模式：使用原始标签（噪声标签）
+            labels_for_proto = targets
         
         # 计算原型距离损失：取与对应类别原型的负相似度
         proto_sim = similarities[torch.arange(len(labels_for_proto)), labels_for_proto]
         loss_proto = -torch.log(torch.exp(proto_sim / tau) / torch.exp(similarities / tau).sum(dim=1))
         
-        # 存储（向量化索引，避免Python循环）
-        losses_cls[index] = loss_cls.detach().cpu()
-        losses_proto[index] = loss_proto.detach().cpu()
-        pl[index] = predicted.cpu()
+        # 存储
+        for b in range(inputs.size(0)):
+            losses_cls[index[b]] = loss_cls[b].item()
+            losses_proto[index[b]] = loss_proto[b].item()
+            pl[index[b]] = predicted[b].item()
+        
+        if (batch_idx + 1) % 50 == 0:
+            print(f'  Processed {batch_idx + 1}/{len(eval_loader)} batches')
     
     # 归一化损失到[0, 1]
     losses_cls = (losses_cls - losses_cls.min()) / (losses_cls.max() - losses_cls.min())
@@ -159,14 +162,31 @@ def eval_train_2dgmm(net, eval_loader, prototype_manager, device, tau=0.1, use_o
     print(f'Loss ranges - cls: [{losses_cls.min():.3f}, {losses_cls.max():.3f}], '
           f'proto: [{losses_proto.min():.3f}, {losses_proto.max():.3f}]')
     
-    # Oracle模式诊断
+    # Oracle模式诊断：显示原型距离损失的改善
     if use_oracle and true_labels_tensor is not None:
+        print(f'[Oracle Diagnostic] Mean proto loss: {losses_proto.mean():.4f} (lower is better with perfect prototypes)')
+        
+        # 关键诊断：检查原型距离是否能区分干净/噪声样本
         eval_dataset = eval_loader.dataset
         if hasattr(eval_dataset, 'noise_labels'):
             noise_labels_np = torch.tensor(eval_dataset.noise_labels)
             true_labels_np = true_labels_tensor.cpu()
             is_clean = (noise_labels_np == true_labels_np)
-            print(f'  Oracle: clean_proto={losses_proto[is_clean].mean():.4f}, noisy_proto={losses_proto[~is_clean].mean():.4f}, delta={losses_proto[~is_clean].mean()-losses_proto[is_clean].mean():.4f}')
+            
+            proto_loss_clean = losses_proto[is_clean].mean()
+            proto_loss_noisy = losses_proto[~is_clean].mean()
+            cls_loss_clean = losses_cls[is_clean].mean()
+            cls_loss_noisy = losses_cls[~is_clean].mean()
+            
+            print(f'[Oracle Diagnostic] Loss comparison:')
+            print(f'  Clean samples: cls_loss={cls_loss_clean:.4f}, proto_loss={proto_loss_clean:.4f}')
+            print(f'  Noisy samples: cls_loss={cls_loss_noisy:.4f}, proto_loss={proto_loss_noisy:.4f}')
+            print(f'  Separation: proto_delta={proto_loss_noisy - proto_loss_clean:.4f} (larger is better)')
+            
+            if proto_loss_noisy <= proto_loss_clean:
+                print(f'  ⚠️  WARNING: Noisy samples have LOWER proto loss than clean!')
+                print(f'       This means perfect prototypes CANNOT distinguish clean/noisy samples!')
+                print(f'       Problem: Pretrained features may not align with label semantics')
     
     # 为保证GMM拟合效果，将损失分别归一化到[0, 1]
     l_cls_norm = losses_cls.reshape(-1, 1).numpy()
@@ -174,6 +194,8 @@ def eval_train_2dgmm(net, eval_loader, prototype_manager, device, tau=0.1, use_o
     
     # Min-Max归一化确保在同一尺度
     input_loss = np.concatenate([l_cls_norm, l_proto_norm], axis=1)  # (N, 2)
+    
+    print(f'Fitting 2D-GMM with input shape: {input_loss.shape}')
     
     # 拟合2D-GMM
     gmm = GaussianMixture(n_components=2, max_iter=10, tol=1e-2, reg_covar=5e-4)
@@ -187,6 +209,8 @@ def eval_train_2dgmm(net, eval_loader, prototype_manager, device, tau=0.1, use_o
     norms = np.linalg.norm(means, axis=1)  # (2,)
     weights = gmm.weights_  # (2,)
     
+    print(f'GMM means: {means}, weights: {weights}, L2 norms: {norms}')
+    
     # 判定干净分量：L2范数较小的分量
     clean_component = norms.argmin()
     noisy_component = 1 - clean_component
@@ -194,6 +218,7 @@ def eval_train_2dgmm(net, eval_loader, prototype_manager, device, tau=0.1, use_o
     # 合理性检查1：均值过于接近则回退到只看CE损失维度
     mean_diff = np.abs(means[0] - means[1]).sum()
     if mean_diff < 0.1:
+        print(f'  ⚠️ GMM means too similar (diff={mean_diff:.4f}), using CE loss only')
         clean_component = 0 if means[0, 0] < means[1, 0] else 1
         noisy_component = 1 - clean_component
     
@@ -201,93 +226,126 @@ def eval_train_2dgmm(net, eval_loader, prototype_manager, device, tau=0.1, use_o
     if weights[clean_component] > 0.95:
         norm_ratio = norms[clean_component] / (norms[noisy_component] + 1e-8)
         if norm_ratio > 0.7:
+            print(f'  ⚠️ Clean weight too high ({weights[clean_component]:.2%}), swapping components')
             clean_component = noisy_component
             noisy_component = 1 - clean_component
+    
+    print(f'Clean component: {clean_component} (L2={norms[clean_component]:.4f}, weight={weights[clean_component]:.2%})')
     
     prob = prob[:, clean_component]
     prob = torch.from_numpy(prob).float()
     
+    # 结果合理性检查
     clean_ratio = (prob > 0.5).sum().item() / len(prob)
-    print(f'  2D-GMM: clean_comp={clean_component}, clean_ratio={clean_ratio:.2%}, means_L2={norms}')
+    print(f'Initial clean ratio: {clean_ratio:.2%}')
+    if clean_ratio > 0.9 or clean_ratio < 0.05:
+        print(f'  ⚠️ Extreme clean ratio ({clean_ratio:.2%}), GMM may have failed!')
     
-    # ========== 基于预测噪声率的样本数量限制 ==========
-    if predicted_noise_rate is not None:
-        total_samples = len(prob)
-        expected_clean_ratio = 1.0 - predicted_noise_rate
-        
-        # 根据噪声率自适应调整容差范围
-        if predicted_noise_rate >= 0.7:
-            tolerance = 0.02  # 极高噪声：±2%
-        elif predicted_noise_rate >= 0.4:
-            tolerance = 0.05  # 高噪声：±5%
-        else:
-            tolerance = 0.1   # 中低噪声：±10%
-        
-        # 新策略：低噪声以预测噪声率为上限，高噪声以预测噪声率为下限
-        if predicted_noise_rate < 0.5:
-            # 低噪声场景：期望干净样本接近100%
-            # 上限 = 1 - 预测噪声率 (最多允许这么多干净样本)
-            # 下限 = 上限 - 变动空间 (放宽下限容许误判)
-            max_clean_ratio = min(1.0, expected_clean_ratio)
-            min_clean_ratio = max(0.0, expected_clean_ratio - tolerance)
-            strategy_desc = f"LOW noise: upper={1-predicted_noise_rate:.1%}, lower=upper-{tolerance:.0%}"
-        else:
-            # 高噪声场景：期望干净样本较少
-            # 下限 = 1 - 预测噪声率 (至少要保留这么多干净样本)
-            # 上限 = 下限 + 变动空间 (允许多选一些可能的干净样本)
-            min_clean_ratio = max(0.0, expected_clean_ratio)
-            max_clean_ratio = min(1.0, expected_clean_ratio + tolerance)
-            strategy_desc = f"HIGH noise: lower={1-predicted_noise_rate:.1%}, upper=lower+{tolerance:.0%}"
-        
-        min_clean_count = int(total_samples * min_clean_ratio)
-        max_clean_count = int(total_samples * max_clean_ratio)
-        
-        # 使用阈值0.5筛选出的干净样本数
-        clean_mask = prob > 0.5
-        current_clean_count = clean_mask.sum().item()
-        
-        if current_clean_count > max_clean_count:
-            sorted_prob, sorted_indices = torch.sort(prob, descending=True)
-            new_prob = prob.clone()
-            for i in range(max_clean_count, total_samples):
-                idx = sorted_indices[i]
-                new_prob[idx] = min(new_prob[idx], 0.49)  # 设置为略低于阈值
-            
-            adjusted_count = (new_prob > 0.5).sum().item()
-            print(f'  Count control: {current_clean_count}->{adjusted_count} (max={max_clean_count})')
-            prob = new_prob
-            
-        elif current_clean_count < min_clean_count:
-            sorted_prob, sorted_indices = torch.sort(prob, descending=True)
-            
-            # 将前min_clean_count个样本概率提升到阈值以上
-            new_prob = prob.clone()
-            for i in range(min_clean_count):
-                idx = sorted_indices[i]
-                if new_prob[idx] <= 0.5:
-                    new_prob[idx] = 0.51  # 设置为略高于阈值
-            
-            adjusted_count = (new_prob > 0.5).sum().item()
-            print(f'  Count control: {current_clean_count}->{adjusted_count} (min={min_clean_count})')
-            prob = new_prob
-        else:
-            pass  # within acceptable range
+    # ========== 基于预测噪声率的样本数量限制（已禁用，仅使用阈值0.5划分） ==========
+    # if predicted_noise_rate is not None:
+    #     total_samples = len(prob)
+    #     expected_clean_ratio = 1.0 - predicted_noise_rate
+    #
+    #     # 根据噪声率自适应调整容差：高噪声场景使用更严格的容差
+    #     if predicted_noise_rate >= 0.7:
+    #         tolerance = 0.02  # 极高噪声：±2%
+    #     elif predicted_noise_rate >= 0.4:
+    #         tolerance = 0.05  # 高噪声：±5%
+    #     else:
+    #         tolerance = 0.1   # 中低噪声：±10%
+    #
+    #     min_clean_ratio = max(0.0, expected_clean_ratio - tolerance)
+    #     max_clean_ratio = min(1.0, expected_clean_ratio + tolerance)
+    #
+    #     min_clean_count = int(total_samples * min_clean_ratio)
+    #     max_clean_count = int(total_samples * max_clean_ratio)
+    #
+    #     # 使用阈值0.5筛选出的干净样本数
+    #     clean_mask = prob > 0.5
+    #     current_clean_count = clean_mask.sum().item()
+    #
+    #     print(f'\n[Sample Count Control]')
+    #     print(f'  Predicted noise rate: {predicted_noise_rate:.1%}')
+    #     print(f'  Expected clean ratio: {expected_clean_ratio:.1%}')
+    #     print(f'  Allowed range: [{min_clean_ratio:.1%}, {max_clean_ratio:.1%}] (±{tolerance:.0%} tolerance)')
+    #     print(f'  Allowed clean samples: [{min_clean_count}, {max_clean_count}] out of {total_samples}')
+    #     print(f'  Current clean samples: {current_clean_count} ({current_clean_count/total_samples:.1%})')
+    #
+    #     if current_clean_count > max_clean_count:
+    #         # 样本过多，按后验概率排序，只取top max_clean_count
+    #         print(f'  ⚠️  Too many clean samples! Applying upper limit...')
+    #         sorted_prob, sorted_indices = torch.sort(prob, descending=True)
+    #
+    #         # 将超出上限的样本概率降低到阈值以下
+    #         new_prob = prob.clone()
+    #         for i in range(max_clean_count, total_samples):
+    #             idx = sorted_indices[i]
+    #             new_prob[idx] = min(new_prob[idx], 0.49)  # 设置为略低于阈值
+    #
+    #         adjusted_count = (new_prob > 0.5).sum().item()
+    #         print(f'  Adjusted to {adjusted_count} clean samples (top-{max_clean_count} by probability)')
+    #         prob = new_prob
+    #
+    #     elif current_clean_count < min_clean_count:
+    #         # 样本过少，放宽阈值，取概率最高的min_clean_count个
+    #         print(f'  ⚠️  Too few clean samples! Applying lower limit...')
+    #         sorted_prob, sorted_indices = torch.sort(prob, descending=True)
+    #
+    #         # 将前min_clean_count个样本概率提升到阈值以上
+    #         new_prob = prob.clone()
+    #         for i in range(min_clean_count):
+    #             idx = sorted_indices[i]
+    #             if new_prob[idx] <= 0.5:
+    #                 new_prob[idx] = 0.51  # 设置为略高于阈值
+    #
+    #         adjusted_count = (new_prob > 0.5).sum().item()
+    #         print(f'  Adjusted to {adjusted_count} clean samples (top-{min_clean_count} by probability)')
+    #         prob = new_prob
+    #     else:
+    #         print(f'  ✓ Within acceptable range, no adjustment needed')
     
     # ========== Oracle模式额外诊断：检查划分准确性 ==========
     if use_oracle and true_labels_tensor is not None:
+        # 计算实际的噪声标签
         eval_dataset = eval_loader.dataset
+        print(f'[DEBUG] eval_dataset type: {type(eval_dataset)}')
+        print(f'[DEBUG] hasattr noise_labels: {hasattr(eval_dataset, "noise_labels")}')
+        
         if hasattr(eval_dataset, 'noise_labels'):
             noise_labels = torch.tensor(eval_dataset.noise_labels)
             true_labels = true_labels_tensor.cpu()
-            is_clean_actual = (noise_labels == true_labels)
-            is_noisy_actual = ~is_clean_actual
-            is_clean_predicted = prob > 0.5
-            true_positives = (is_clean_predicted & is_clean_actual).sum().item()
-            false_positives = (is_clean_predicted & is_noisy_actual).sum().item()
-            false_negatives = (~is_clean_predicted & is_clean_actual).sum().item()
+            
+            # 识别真正的干净样本和噪声样本
+            is_clean_actual = (noise_labels == true_labels)  # 真实干净样本
+            is_noisy_actual = ~is_clean_actual  # 真实噪声样本
+            
+            # 使用阈值划分（通常0.5）
+            threshold = 0.5
+            is_clean_predicted = prob > threshold  # 预测为干净
+            
+            # 计算准确性指标
+            true_positives = (is_clean_predicted & is_clean_actual).sum().item()  # 正确识别干净样本
+            false_positives = (is_clean_predicted & is_noisy_actual).sum().item()  # 噪声被误判为干净
+            true_negatives = (~is_clean_predicted & is_noisy_actual).sum().item()  # 正确识别噪声
+            false_negatives = (~is_clean_predicted & is_clean_actual).sum().item()  # 干净被误判为噪声
+            
             precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
             recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
-            print(f'  Oracle: precision={precision:.4f}, recall={recall:.4f}, pred_clean={is_clean_predicted.sum().item()}')
+            
+            print(f'\n[Oracle Quality Check]')
+            print(f'  Actual clean samples: {is_clean_actual.sum().item()}')
+            print(f'  Actual noisy samples: {is_noisy_actual.sum().item()}')
+            print(f'  Predicted clean: {is_clean_predicted.sum().item()}')
+            print(f'  True Positives (clean→clean): {true_positives}')
+            print(f'  False Positives (noisy→clean): {false_positives}')
+            print(f'  False Negatives (clean→noisy): {false_negatives}')
+            print(f'  Precision: {precision:.4f} (of predicted clean, how many are truly clean)')
+            print(f'  Recall: {recall:.4f} (of actual clean, how many are identified)')
+        else:
+            print(f'\n[Oracle Quality Check] SKIPPED - eval_dataset has no noise_labels attribute')
+            print(f'  Available attributes: {[attr for attr in dir(eval_dataset) if not attr.startswith("_")][:20]}')
+    
+    print('='*50 + '\n')
     
     return prob, pl
 
@@ -388,29 +446,17 @@ def main():
     net1 = create_model()
     net2 = create_model()
     cudnn.benchmark = True
-    # TF32 加速：4090D (Ampere架构) 矩阵乘法自动使用 TF32，精度损失可忽略
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
 
     optimizer1 = optim.SGD(net1.parameters(), lr=p['lr'], momentum=0.9, weight_decay=5e-4)
     optimizer2 = optim.SGD(net2.parameters(), lr=p['lr'], momentum=0.9, weight_decay=5e-4)
     
-    # AMP 混合精度训练：4090D FP16 tensor core 吞吐是 FP32 的 ~8 倍
-    scaler = torch.amp.GradScaler('cuda')
-    
     # 初始化原型管理器
-    # 动态获取backbone维度和投影维度
-    dummy_input = torch.randn(2, 3, 32, 32).to(device)  # batch≥2, BN1d训练模式要求
-    net1.eval()
+    # 动态获取特征维度（ResNet18-CIFAR是512维）
+    dummy_input = torch.randn(1, 3, 32, 32).to(device)
     with torch.no_grad():
         dummy_feat = net1(dummy_input, forward_pass='backbone')
-        backbone_dim = dummy_feat.shape[1]
-        dummy_proj = net1(dummy_input, forward_pass='proj')
-        proj_dim = dummy_proj.shape[1]
-    net1.train()
-    print(f'\n[INFO] Backbone dimension: {backbone_dim}, Projection dimension: {proj_dim}')
-    # 原型在投影空间中工作，feature_dim使用proj_dim
-    feature_dim = proj_dim
+        feature_dim = dummy_feat.shape[1]
+    print(f'\n[INFO] Feature dimension detected: {feature_dim}')
     
     prototype_manager1 = None
     prototype_manager2 = None
@@ -420,13 +466,8 @@ def main():
     if args.load_state_dict is not None:
         print('Loading saved state dict from {}'.format(args.load_state_dict))
         checkpoint = torch.load(args.load_state_dict, weights_only=False)
-        # strict=False允许加载旧版checkpoint（不含proj_head）
-        missing1 = net1.load_state_dict(checkpoint['net1_state_dict'], strict=False)
-        missing2 = net2.load_state_dict(checkpoint['net2_state_dict'], strict=False)
-        if missing1.missing_keys:
-            print(f'[Net1] Missing keys (will be randomly initialized): {missing1.missing_keys}')
-        if missing2.missing_keys:
-            print(f'[Net2] Missing keys (will be randomly initialized): {missing2.missing_keys}')
+        net1.load_state_dict(checkpoint['net1_state_dict'])
+        net2.load_state_dict(checkpoint['net2_state_dict'])
         optimizer1.load_state_dict(checkpoint['optimizer1'])
         optimizer2.load_state_dict(checkpoint['optimizer2'])
         start_epoch = checkpoint['epoch']+1
@@ -603,9 +644,9 @@ def main():
         if epoch<p['warmup']:       
             warmup_trainloader = get_loader(p, 'warmup', meta_info)
             print('Warmup Net1')
-            scanmix_warmup(epoch,net1,optimizer1,warmup_trainloader, CEloss, conf_penalty, args.noise_mode, device=device, scaler=scaler)    
+            scanmix_warmup(epoch,net1,optimizer1,warmup_trainloader, CEloss, conf_penalty, args.noise_mode, device=device)    
             print('\nWarmup Net2')
-            scanmix_warmup(epoch,net2,optimizer2,warmup_trainloader, CEloss, conf_penalty, args.noise_mode, device=device, scaler=scaler)
+            scanmix_warmup(epoch,net2,optimizer2,warmup_trainloader, CEloss, conf_penalty, args.noise_mode, device=device)
 
             if epoch == p['warmup']-1:
                 prob1,_,_=scanmix_eval_train(args,net1,[], epoch, eval_loader, CE, device=device)   
@@ -674,9 +715,9 @@ def main():
                     train_neighbor_indices_static = None
                     train_neighbor_indices_dynamic = None
                 
-                # 提取投影空间特征并初始化原型 - Net1
-                print('\n[Net1] Extracting projection features and initializing prototypes...')
-                features1, noisy_targets1, predictions1, probs1 = extract_features(net1, eval_loader, device, use_proj=True)
+                # 提取特征并初始化原型 - Net1
+                print('\n[Net1] Extracting features and initializing prototypes...')
+                features1, noisy_targets1, predictions1, probs1 = extract_features(net1, eval_loader, device)
                 
                 # 从配置文件读取原型学习超参数，提供默认值以保持向后兼容
                 prototype_alpha_low = p.get('prototype_alpha_low', 0.9)
@@ -716,9 +757,9 @@ def main():
                         pred_probs=probs1.to(device)
                     )
                 
-                # 提取投影空间特征并初始化原型 - Net2
-                print('\n[Net2] Extracting projection features and initializing prototypes...')
-                features2, noisy_targets2, predictions2, probs2 = extract_features(net2, eval_loader, device, use_proj=True)
+                # 提取特征并初始化原型 - Net2
+                print('\n[Net2] Extracting features and initializing prototypes...')
+                features2, noisy_targets2, predictions2, probs2 = extract_features(net2, eval_loader, device)
                 
                 prototype_manager2 = PrototypeManager(p['num_classes'], features2.shape[1], device, alpha=prototype_alpha, queue_size=prototype_queue_size, dataset_size=50000)
                 
@@ -858,8 +899,8 @@ def main():
             
             clean_ratio1 = pred1.sum() / len(pred1)
             clean_ratio2 = pred2.sum() / len(pred2)
-            labeled_count1 = pred1.sum().item()  # Net1 自己 GMM 选出的干净样本数
-            labeled_count2 = pred2.sum().item()  # Net2 自己 GMM 选出的干净样本数
+            labeled_count1 = pred2.sum().item()
+            labeled_count2 = pred1.sum().item()
             if epoch == p['warmup'] + 1 or epoch % 2 == 1:
                 log_info(f'[DIAGNOSIS] Clean sample ratio - Net1: {clean_ratio1:.4f}, Net2: {clean_ratio2:.4f}')
                 log_info(f'[DIAGNOSIS] Labeled sample count - Net1: {int(labeled_count1)}, Net2: {int(labeled_count2)}')
@@ -876,8 +917,21 @@ def main():
             if args.use_oracle:
                 lambda_proto = args.lambda_proto_oracle
                 noise_level = "Oracle"
-                if epoch == p['warmup'] + 1:
-                    log_info(f'[Oracle] lambda_proto={lambda_proto:.4f}')
+                log_info(f'\n[Oracle Prototype Strategy] Epoch {epoch}')
+                print(f'  lambda_proto = {lambda_proto:.4f}')
+                
+                if lambda_proto > 0:
+                    print(f'  Mode: Oracle Prototypes + Contrastive Loss')
+                    print(f'  - Prototypes: Ground Truth labels')
+                    print(f'  - Contrastive Loss: Ground Truth labels (weight={lambda_proto:.2f})')
+                else:
+                    print(f'  Mode: Oracle Prototypes for 2D-GMM ONLY (Testing Data Partitioning)')
+                    print(f'  - Prototypes initialized/updated with: Ground Truth labels')
+                    print(f'  - Prototypes used for: 2D-GMM sample selection ONLY')
+                    print(f'  - Contrastive Loss: DISABLED (lambda_proto=0)')
+                    print(f'  - Purpose: Test perfect prototype impact on data partitioning')
+                
+                print('='*70)
                 
                 # 获取真实标签映射（用于训练中的原型更新）
                 base_dataset = labeled_trainloader.dataset.dataset
@@ -893,36 +947,46 @@ def main():
                 
                 if predicted_noise_rate is not None:
                     if predicted_noise_rate <= 0.3:
+                        # 低噪声：从start逐渐增长到end
                         warmup_end = p['warmup']
                         rampup_epochs = lambda_proto_low_rampup
                         rampup_end = warmup_end + rampup_epochs
+                        
                         if epoch < rampup_end:
-                            progress = (epoch - warmup_end) / rampup_epochs
+                            # 线性增长
+                            progress = (epoch - warmup_end) / rampup_epochs  # 0 -> 1
                             lambda_proto = lambda_proto_low_start + (lambda_proto_low_end - lambda_proto_low_start) * progress
                         else:
                             lambda_proto = lambda_proto_low_end
+                        
                         noise_level = "Low"
-                        log_info(f'[Prototype Strategy] Epoch {epoch}: Low Noise Mode')
+                        log_info(f'\n[Prototype Strategy] Epoch {epoch}: Low Noise Mode')
                         log_info(f'  Predicted noise rate: {predicted_noise_rate:.1%}')
                         log_info(f'  lambda_proto = {lambda_proto:.3f} (Epoch {warmup_end}→{rampup_end}: {lambda_proto_low_start:.1f}→{lambda_proto_low_end:.1f})')
+                        
                     elif predicted_noise_rate <= 0.7:
                         lambda_proto = lambda_proto_medium
                         noise_level = "Medium"
-                        log_info(f'[Prototype Strategy] Epoch {epoch}: Medium Noise Mode')
+                        log_info(f'\n[Prototype Strategy] Epoch {epoch}: Medium Noise Mode')
                         log_info(f'  Predicted noise rate: {predicted_noise_rate:.1%}')
                         log_info(f'  lambda_proto = {lambda_proto:.2f} (fixed)')
                     else:
                         lambda_proto = lambda_proto_high
                         noise_level = "High"
-                        log_info(f'[Prototype Strategy] Epoch {epoch}: High Noise Mode')
+                        log_info(f'\n[Prototype Strategy] Epoch {epoch}: High Noise Mode')
                         log_info(f'  Predicted noise rate: {predicted_noise_rate:.1%}')
                         log_info(f'  lambda_proto = {lambda_proto:.2f} (fixed)')
                 else:
+                    # 如果还没预测出噪声率（理论上不应该到这里），默认为0
                     lambda_proto = 0.0
                     noise_level = "Waiting"
-                    log_info(f'[Prototype Strategy] Epoch {epoch}: Waiting for noise rate prediction')
+                    log_info(f'\n[Prototype Strategy] Epoch {epoch}: Waiting for noise rate prediction')
+                    print(f'  lambda_proto = {lambda_proto:.2f} (will be set after warmup)')
                 
                 true_labels_map = None
+                print(f'  Prototypes used for: 2D-GMM sample selection + Training')
+                print(f'  Training method: DivideMix + Prototype Contrastive Loss')
+                print('='*70)
             
             # ========== 计算双源邻居融合权重 α ==========
             # α: 静态邻居（SimCLR）的权重，动态邻居权重为(1-α)
@@ -933,12 +997,23 @@ def main():
             
             if epoch <= neighbor_fusion_switch_epoch:
                 neighbor_fusion_alpha = neighbor_fusion_alpha_early
+                print(f'\n[Dual-Source Neighbor Fusion]')
+                print(f'  Epoch {epoch}: α (static weight) = {neighbor_fusion_alpha:.2f}')
+                if neighbor_fusion_alpha == 1.0:
+                    print(f'  Using ONLY static SimCLR neighbors (dynamic weight = 0.0)')
+                else:
+                    print(f'  Static: {neighbor_fusion_alpha:.1%}, Dynamic: {1-neighbor_fusion_alpha:.1%}')
+                print(f'  Reason: Building stable feature space in early training')
             else:
                 neighbor_fusion_alpha = neighbor_fusion_alpha_late
-            log_info(f'[Neighbor Fusion] Epoch {epoch}: α={neighbor_fusion_alpha:.2f} (static:{neighbor_fusion_alpha:.0%}, dynamic:{1-neighbor_fusion_alpha:.0%})')
+                print(f'\n[Dual-Source Neighbor Fusion]')
+                print(f'  Epoch {epoch}: α (static weight) = {neighbor_fusion_alpha:.2f}')
+                print(f'  Static: {neighbor_fusion_alpha:.1%}, Dynamic: {1-neighbor_fusion_alpha:.1%}')
+                print(f'  Gradually incorporating dynamic neighbors from current model')
+            print('='*70)
             
             # 训练Net1
-            scanmix_train(p, epoch,net1,net2,optimizer1,labeled_trainloader, unlabeled_trainloader, criterion_dm, args.lambda_u, device=device, prototype_manager=prototype_manager1, lambda_proto=lambda_proto, neighbor_indices_static=train_neighbor_indices_static, neighbor_indices_dynamic=train_neighbor_indices_dynamic, neighbor_fusion_alpha=neighbor_fusion_alpha, use_oracle=args.use_oracle, true_labels_map=true_labels_map, scaler=scaler) # train net1  
+            scanmix_train(p, epoch,net1,net2,optimizer1,labeled_trainloader, unlabeled_trainloader, criterion_dm, args.lambda_u, device=device, prototype_manager=prototype_manager1, lambda_proto=lambda_proto, neighbor_indices_static=train_neighbor_indices_static, neighbor_indices_dynamic=train_neighbor_indices_dynamic, neighbor_fusion_alpha=neighbor_fusion_alpha, use_oracle=args.use_oracle, true_labels_map=true_labels_map) # train net1  
             
             print('\n[DM] Train Net2')
             meta_info['probability'] = prob1
@@ -951,7 +1026,7 @@ def main():
                 true_labels_map = {i: base_dataset.targets[i] for i in range(len(base_dataset.targets))}
             
             # 训练Net2
-            scanmix_train(p, epoch,net2,net1,optimizer2,labeled_trainloader, unlabeled_trainloader, criterion_dm, args.lambda_u, device=device, prototype_manager=prototype_manager2, lambda_proto=lambda_proto, neighbor_indices_static=train_neighbor_indices_static, neighbor_indices_dynamic=train_neighbor_indices_dynamic, neighbor_fusion_alpha=neighbor_fusion_alpha, use_oracle=args.use_oracle, true_labels_map=true_labels_map, scaler=scaler) # train net2
+            scanmix_train(p, epoch,net2,net1,optimizer2,labeled_trainloader, unlabeled_trainloader, criterion_dm, args.lambda_u, device=device, prototype_manager=prototype_manager2, lambda_proto=lambda_proto, neighbor_indices_static=train_neighbor_indices_static, neighbor_indices_dynamic=train_neighbor_indices_dynamic, neighbor_fusion_alpha=neighbor_fusion_alpha, use_oracle=args.use_oracle, true_labels_map=true_labels_map) # train net2
             
             if not args.dividemix_only:
                 # 确保lr_sl已设置
@@ -973,20 +1048,23 @@ def main():
                 scanmix_scan(neighbor_dataloader, net1, criterion_sl, optimizer1, epoch, device,
                            neighbor_indices_static=train_neighbor_indices_static,
                            neighbor_indices_dynamic=train_neighbor_indices_dynamic,
-                           neighbor_fusion_alpha=neighbor_fusion_alpha, scaler=scaler)
+                           neighbor_fusion_alpha=neighbor_fusion_alpha)
                 meta_info['predicted_labels'] = pl_1  
                 neighbor_dataloader = get_loader(p, 'neighbors', meta_info)
                 print('\n[SL] Train Net2')
                 scanmix_scan(neighbor_dataloader, net2, criterion_sl, optimizer2, epoch, device,
                            neighbor_indices_static=train_neighbor_indices_static,
                            neighbor_indices_dynamic=train_neighbor_indices_dynamic,
-                           neighbor_fusion_alpha=neighbor_fusion_alpha, scaler=scaler)
+                           neighbor_fusion_alpha=neighbor_fusion_alpha)
 
         acc = scanmix_test(epoch,net1,net2,test_loader, device=device)
         
-        # Epoch总结
+        # ========== 详细的Epoch总结 ==========
+        log_info(f'\n{"="*80}')
         log_info(f'EPOCH {epoch} SUMMARY')
+        log_info(f'{"="*80}')
         log_info(f'Test Accuracy: {acc:.2f}%')
+        
         if epoch >= p['warmup']:
             if predicted_noise_rate is not None:
                 log_info(f'Predicted Noise Rate: {predicted_noise_rate:.1%}')
@@ -1001,11 +1079,14 @@ def main():
                     log_info(f'Lambda Proto: {lambda_proto:.3f}')
                 log_info(f'Neighbor Fusion Alpha: {neighbor_fusion_alpha:.2f}')
         
+        log_info(f'{"="*80}\n')
+        
         test_log.write('Epoch:%d   Accuracy:%.2f\n'%(epoch,acc))
         test_log.flush()
         
         if epoch >= p['warmup'] and prototype_manager1 is not None:
             if epoch == p['warmup'] + 1 or epoch % 2 == 1:
+                log_info('\n' + '-'*60)
                 log_info('[DIAGNOSIS] Prototype Statistics:')
                 stats1 = prototype_manager1.get_prototype_stats()
                 stats2 = prototype_manager2.get_prototype_stats()
@@ -1022,6 +1103,7 @@ def main():
                     fix_log.write('Epoch:%d [Net2] Updates: %d, Avg change: %.4f, Max similarity: %.4f\n'%(
                         epoch, stats2['update_count'], stats2['avg_inter_similarity'], stats2['max_inter_similarity']))
                 fix_log.flush()
+                log_info('-'*60 + '\n')
             
             # 保存原型
             if epoch % 10 == 0:  # 每10个epoch保存一次

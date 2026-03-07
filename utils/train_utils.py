@@ -766,16 +766,15 @@ class PrototypeManager:
         return distances
 
 @torch.no_grad()
-def extract_features(net, dataloader, device, use_proj=False):
+def extract_features(net, dataloader, device):
     """
     提取所有样本的特征和预测概率
     Args:
         net: 网络模型
         dataloader: 数据加载器
         device: 设备
-        use_proj: 是否使用投影头提取特征（用于原型空间）
     Returns:
-        all_features: (N, feature_dim) 特征（use_proj=True时为投影空间特征）
+        all_features: (N, feature_dim) 特征
         all_targets: (N,) 真实标签
         all_predictions: (N,) 预测标签
         all_probs: (N, num_classes) 预测概率分布
@@ -786,28 +785,24 @@ def extract_features(net, dataloader, device, use_proj=False):
     all_predictions = []
     all_probs = []
     
-    forward_mode = 'proj' if use_proj else 'backbone'
+    print('Extracting features from all samples...')
     for batch_idx, batch in enumerate(dataloader):
         # 处理不同的数据格式
         if isinstance(batch, dict):
-            inputs = batch['image'].to(device, non_blocking=True)
+            # 字典格式：{'image': ..., 'target': ...}
+            inputs = batch['image'].to(device)
             targets = batch['target']
         elif isinstance(batch, (tuple, list)):
-            inputs = batch[0].to(device, non_blocking=True)
+            # 元组格式：(img, target, index) 或 (img, target)
+            inputs = batch[0].to(device)
             targets = batch[1]
         else:
             raise ValueError(f'Unsupported batch type: {type(batch)}')
         
-        # 共享backbone前向传播，减少重复计算
-        with torch.amp.autocast('cuda'):
-            if use_proj:
-                # dm_and_proj: 1次backbone + dm_head + proj_head
-                outputs, features = net(inputs, forward_pass='dm_and_proj')
-            else:
-                # backbone + dm_head: 1次backbone
-                features = net(inputs, forward_pass='backbone')
-                outputs = net(features, forward_pass='dm_head')
-        
+        # 提取特征（使用backbone，不经过分类头）
+        features = net(inputs, forward_pass='backbone')
+        # 获取预测（使用DivideMix head）
+        outputs = net(inputs, forward_pass='dm')
         probs = torch.softmax(outputs, dim=1)
         predictions = probs.argmax(dim=1)
         
@@ -815,6 +810,9 @@ def extract_features(net, dataloader, device, use_proj=False):
         all_targets.append(targets)
         all_predictions.append(predictions.cpu())
         all_probs.append(probs.cpu())
+        
+        if (batch_idx + 1) % 50 == 0:
+            print(f'  Processed {batch_idx + 1}/{len(dataloader)} batches')
     
     all_features = torch.cat(all_features, dim=0)
     all_targets = torch.cat(all_targets, dim=0)
@@ -945,7 +943,7 @@ def selflabel_train(train_loader, model, criterion, optimizer, epoch, ema=None):
 
 
 def scanmix_train(p,epoch,net,net2,optimizer,labeled_trainloader,unlabeled_trainloader,criterion,lambda_u,device,
-                  prototype_manager=None,lambda_proto=1.0,neighbor_indices_static=None,neighbor_indices_dynamic=None,neighbor_fusion_alpha=0.8,use_oracle=False,true_labels_map=None,scaler=None):
+                  prototype_manager=None,lambda_proto=1.0,neighbor_indices_static=None,neighbor_indices_dynamic=None,neighbor_fusion_alpha=0.8,use_oracle=False,true_labels_map=None):
     """
     ScanMix训练函数（支持Oracle模式和双源邻居融合）
     
@@ -955,15 +953,14 @@ def scanmix_train(p,epoch,net,net2,optimizer,labeled_trainloader,unlabeled_train
         neighbor_indices_static: 静态邻居库（SimCLR，不变）
         neighbor_indices_dynamic: 动态邻居库（每50轮更新）
         neighbor_fusion_alpha: 静态邻居权重（α），动态邻居权重为(1-α)
-        scaler: torch.amp.GradScaler for mixed precision
     """
     return _scanmix_train_impl(p,epoch,net,net2,optimizer,labeled_trainloader,unlabeled_trainloader,
                                criterion,lambda_u,device,prototype_manager,lambda_proto,neighbor_indices_static,neighbor_indices_dynamic,neighbor_fusion_alpha,
-                               use_oracle,true_labels_map,scaler=scaler)
+                               use_oracle,true_labels_map)
 
 
 def _scanmix_train_impl(p,epoch,net,net2,optimizer,labeled_trainloader,unlabeled_trainloader,criterion,lambda_u,device,
-                  prototype_manager=None,lambda_proto=1.0,neighbor_indices_static=None,neighbor_indices_dynamic=None,neighbor_fusion_alpha=0.8,use_oracle=False,true_labels_map=None,scaler=None):
+                  prototype_manager=None,lambda_proto=1.0,neighbor_indices_static=None,neighbor_indices_dynamic=None,neighbor_fusion_alpha=0.8,use_oracle=False,true_labels_map=None):
     """
     ScanMix训练函数（内部实现，支持双源邻居融合）
     """
@@ -980,10 +977,14 @@ def _scanmix_train_impl(p,epoch,net,net2,optimizer,labeled_trainloader,unlabeled
         progress = ProgressMeter(len(labeled_trainloader),
             [labeled_losses, unlabeled_losses, proto_losses],
             prefix="Epoch: [{}]".format(epoch))
+        print(f'\n*** PROTOTYPE MANAGER ACTIVE for Epoch {epoch} ***')
+        sys.stdout.flush()
     else:
         progress = ProgressMeter(len(labeled_trainloader),
             [labeled_losses, unlabeled_losses],
             prefix="Epoch: [{}]".format(epoch))
+        print(f'\n*** WARNING: NO PROTOTYPE MANAGER for Epoch {epoch} ***')
+        sys.stdout.flush()
     
     if prototype_manager is not None:
         proto_criterion = nn.CrossEntropyLoss()
@@ -992,7 +993,16 @@ def _scanmix_train_impl(p,epoch,net,net2,optimizer,labeled_trainloader,unlabeled
     unlabeled_train_iter = iter(unlabeled_trainloader)    
     num_iter = (len(labeled_trainloader.dataset)//p['batch_size'])+1
     
+    print(f'\n@@@ ABOUT TO START LOOP: {len(labeled_trainloader)} batches, prototype_manager={prototype_manager is not None} @@@')
+    sys.stdout.flush()
+    
     for batch_idx, (inputs_x, inputs_x2, labels_x, w_x, indices_x) in enumerate(labeled_trainloader):
+        if batch_idx == 0:
+            if prototype_manager is not None:
+                print(f'\n*** batch 0: prototype_manager is NOT None ***')
+            else:
+                print(f'\n*** batch 0: prototype_manager IS None! ***')
+            sys.stdout.flush()
         try:
             inputs_u, inputs_u2 = next(unlabeled_train_iter)
         except:
@@ -1004,10 +1014,10 @@ def _scanmix_train_impl(p,epoch,net,net2,optimizer,labeled_trainloader,unlabeled
         labels_x = torch.zeros(batch_size, p['num_classes']).scatter_(1, labels_x.view(-1,1), 1)        
         w_x = w_x.view(-1,1).type(torch.FloatTensor) 
 
-        inputs_x, inputs_x2, labels_x, w_x = inputs_x.to(device, non_blocking=True), inputs_x2.to(device, non_blocking=True), labels_x.to(device, non_blocking=True), w_x.to(device, non_blocking=True)
-        inputs_u, inputs_u2 = inputs_u.to(device, non_blocking=True), inputs_u2.to(device, non_blocking=True)
+        inputs_x, inputs_x2, labels_x, w_x = inputs_x.to(device), inputs_x2.to(device), labels_x.to(device), w_x.to(device)
+        inputs_u, inputs_u2 = inputs_u.to(device), inputs_u2.to(device)
 
-        with torch.no_grad(), torch.amp.autocast('cuda'):
+        with torch.no_grad():
             # label co-guessing of unlabeled samples
             outputs_u11 = net(inputs_u, forward_pass='dm')
             outputs_u12 = net(inputs_u2, forward_pass='dm')
@@ -1045,30 +1055,22 @@ def _scanmix_train_impl(p,epoch,net,net2,optimizer,labeled_trainloader,unlabeled
         
         mixed_input = l * input_a + (1 - l) * input_b        
         mixed_target = l * target_a + (1 - l) * target_b
-        
-        with torch.amp.autocast('cuda'):
-            logits = net(mixed_input, forward_pass='dm')
-            logits_x = logits[:batch_size*2]
-            logits_u = logits[batch_size*2:]        
-               
-            Lx, Lu, lamb = criterion(logits_x, mixed_target[:batch_size*2], logits_u, mixed_target[batch_size*2:],lambda_u, epoch+batch_idx/num_iter, p['warmup'])
+                
+        logits = net(mixed_input, forward_pass='dm')
+        logits_x = logits[:batch_size*2]
+        logits_u = logits[batch_size*2:]        
+           
+        Lx, Lu, lamb = criterion(logits_x, mixed_target[:batch_size*2], logits_u, mixed_target[batch_size*2:],lambda_u, epoch+batch_idx/num_iter, p['warmup'])
         
         # ========== 特征提取（用于原型更新，无论lambda_proto是否为0） ==========
         features_x_clean = None
         target_labels_x_clean = None
-        proj_x = None
-        proj_x2 = None
         
         if prototype_manager is not None and epoch > p['warmup'] and prototype_manager.prototypes is not None:
-            with torch.amp.autocast('cuda'):
-                # 1. 当前网络的投影特征（合并为单次前向传播，有梯度）
-                proj_all_own = net(torch.cat([inputs_x, inputs_x2], dim=0), forward_pass='proj')
-                proj_x, proj_x2 = proj_all_own.split(batch_size)
-                
-                # 2. 对偶网络的投影特征（合并为单次前向传播，无梯度）
-                # Cross-net: Net1 原型 ← Net2 proj, Net2 原型 ← Net1 proj
-                with torch.no_grad():
-                    features_x_clean = net2(torch.cat([inputs_x, inputs_x2], dim=0), forward_pass='proj')
+            # 提取特征（用于原型更新或原型损失计算）
+            features_x = net(inputs_x, forward_pass='backbone')
+            features_x2 = net(inputs_x2, forward_pass='backbone')
+            features_x_clean = torch.cat([features_x, features_x2], dim=0)
             
             # 获取标签（Oracle模式使用真实标签，标准模式使用伪标签）
             if use_oracle and true_labels_map is not None:
@@ -1084,44 +1086,48 @@ def _scanmix_train_impl(p,epoch,net,net2,optimizer,labeled_trainloader,unlabeled
         proto_accuracy = 0
         
         if prototype_manager is not None and epoch > p['warmup'] and prototype_manager.prototypes is not None and lambda_proto > 0:
+            if batch_idx == 0:
+                print(f'\n*** COMPUTING PROTOTYPE LOSS at batch 0, epoch {epoch} ***')
+                if use_oracle:
+                    print(f'  [Oracle Mode] Using GROUND TRUTH labels for prototype contrastive loss')
+                sys.stdout.flush()
             try:
-                with torch.amp.autocast('cuda'):
-                    # 计算原型对比损失（参与反向传播）
-                    # 使用当前网络（own-net）的 proj 特征，确保梯度正确流回 net 的 proj_head
-                    # features_x_clean 是对偶网络的特征（仅用于原型 EMA 更新），不参与此处梯度
-                    features_for_loss = torch.cat([proj_x, proj_x2], dim=0)
-                    features_norm = F.normalize(features_for_loss, dim=1)
-                    prototypes_norm = F.normalize(prototype_manager.prototypes, dim=1)
-                    similarities = torch.mm(features_norm, prototypes_norm.t()) / temperature
-                    L_proto = proto_criterion(similarities, target_labels_x_clean)
-                    
-                    # ========== 邻居一致性损失改进：Weak-to-Strong + 锐化KL散度 ==========
-                    # 1. 核心逻辑改进：从"对称"转向"非对称教师制"
-                    #    - 弱增强视图作为"教师"（锚点），经过detach停止梯度
-                    #    - 强增强视图作为"学生"，被教师指导
-                    # 2. 数学度量改进：从MSE转向锐化KL散度
-                    #    - 对弱增强分配概率进行温度锐化（T=0.5），产生"硬决策"
-                    #    - 使用KL散度衡量分布差异，具有更强的拉动力
-                    
-                    features_x_norm = F.normalize(proj_x, dim=1)
-                    features_x2_norm = F.normalize(proj_x2, dim=1)
-                    prototypes_norm = F.normalize(prototype_manager.prototypes, dim=1)
-                    
-                    # 弱增强视图（inputs_x）作为"教师"
-                    proto_assign_weak = F.softmax(torch.mm(features_x_norm, prototypes_norm.t()) / temperature, dim=1)
-                    
-                    # 温度锐化处理（T=0.5）：q̃_w = Normalize(q_w^(1/T))
-                    T_sharpen = 0.5
-                    proto_assign_weak_sharpened = torch.pow(proto_assign_weak, 1.0 / T_sharpen)
-                    proto_assign_weak_sharpened = proto_assign_weak_sharpened / proto_assign_weak_sharpened.sum(dim=1, keepdim=True)
-                    proto_assign_weak_teacher = proto_assign_weak_sharpened.detach()  # 停止梯度
-                    
-                    # 强增强视图（inputs_x2）作为"学生"
-                    proto_assign_strong = F.softmax(torch.mm(features_x2_norm, prototypes_norm.t()) / temperature, dim=1)
-                    
-                    # KL散度损失：D_KL(teacher || student)
-                    # 注意：F.kl_div的input应该是log概率，target是概率
-                    L_neighbor = F.kl_div(proto_assign_strong.log(), proto_assign_weak_teacher, reduction='batchmean')
+                # 计算原型对比损失（参与反向传播）
+                features_norm = F.normalize(features_x_clean, dim=1)
+                prototypes_norm = F.normalize(prototype_manager.prototypes, dim=1)
+                similarities = torch.mm(features_norm, prototypes_norm.t()) / temperature
+                L_proto = proto_criterion(similarities, target_labels_x_clean)
+                
+                # ========== 邻居一致性损失改进：Weak-to-Strong + 锐化KL散度 ==========
+                # 1. 核心逻辑改进：从"对称"转向"非对称教师制"
+                #    - 弱增强视图作为"教师"（锚点），经过detach停止梯度
+                #    - 强增强视图作为"学生"，被教师指导
+                # 2. 数学度量改进：从MSE转向锐化KL散度
+                #    - 对弱增强分配概率进行温度锐化（T=0.5），产生"硬决策"
+                #    - 使用KL散度衡量分布差异，具有更强的拉动力
+                
+                features_x_norm = F.normalize(features_x, dim=1)
+                features_x2_norm = F.normalize(features_x2, dim=1)
+                prototypes_norm = F.normalize(prototype_manager.prototypes, dim=1)
+                
+                # 弱增强视图（inputs_x）作为"教师"
+                proto_assign_weak = F.softmax(torch.mm(features_x_norm, prototypes_norm.t()) / temperature, dim=1)
+                
+                # 温度锐化处理（T=0.5）：q̃_w = Normalize(q_w^(1/T))
+                T_sharpen = 0.5
+                proto_assign_weak_sharpened = torch.pow(proto_assign_weak, 1.0 / T_sharpen)
+                proto_assign_weak_sharpened = proto_assign_weak_sharpened / proto_assign_weak_sharpened.sum(dim=1, keepdim=True)
+                proto_assign_weak_teacher = proto_assign_weak_sharpened.detach()  # 停止梯度
+                
+                # 强增强视图（inputs_x2）作为"学生"
+                proto_assign_strong = F.softmax(torch.mm(features_x2_norm, prototypes_norm.t()) / temperature, dim=1)
+                
+                # KL散度损失：D_KL(teacher || student)
+                # 注意：F.kl_div的input应该是log概率，target是概率
+                L_neighbor = F.kl_div(proto_assign_strong.log(), proto_assign_weak_teacher, reduction='batchmean')
+                
+                if batch_idx == 0:
+                    print(f'  Neighbor consistency loss: {L_neighbor.item():.4f}')
                 
                 proto_losses.update(L_proto.item())
                 
@@ -1133,33 +1139,38 @@ def _scanmix_train_impl(p,epoch,net,net2,optimizer,labeled_trainloader,unlabeled
                 raise
         
         # regularization
-        with torch.amp.autocast('cuda'):
-            prior = torch.ones(p['num_classes'])/p['num_classes']
-            prior = prior.to(device)        
-            pred_mean = torch.softmax(logits, dim=1).mean(0)
-            penalty = torch.sum(prior*torch.log(prior/pred_mean))
+        prior = torch.ones(p['num_classes'])/p['num_classes']
+        prior = prior.to(device)        
+        pred_mean = torch.softmax(logits, dim=1).mean(0)
+        penalty = torch.sum(prior*torch.log(prior/pred_mean))
 
         loss = Lx + lamb * Lu + penalty
         if prototype_manager is not None and lambda_proto > 0:
+            if batch_idx == 0:
+                print(f'  [Batch {batch_idx}] Applying prototype loss: lambda_proto={lambda_proto:.4f}')
+                l_proto_val = L_proto.item() if isinstance(L_proto, torch.Tensor) else L_proto
+                l_neighbor_val = L_neighbor.item() if isinstance(L_neighbor, torch.Tensor) else L_neighbor
+                print(f'    L_proto={l_proto_val:.4f}, L_neighbor={l_neighbor_val:.4f}')
+            
             # 邻居一致性损失权重为原型损失的一半
             lambda_neighbor = 0.5 * lambda_proto
             loss = loss + lambda_proto * L_proto + lambda_neighbor * L_neighbor
         
-        # compute gradient and do SGD step (AMP mixed precision)
+        # compute gradient and do SGD step
         optimizer.zero_grad()
-        if scaler is not None:
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss.backward()
-            optimizer.step()
+        loss.backward()
+        optimizer.step()
+        
+        if batch_idx % 100 == 0:
+            print(f'  [Batch {batch_idx}] Model parameters updated (optimizer.step completed)')
 
         # ⭐ 原型更新（batch级更新）
         if prototype_manager is not None and epoch > p['warmup']:
             with torch.no_grad():
                 if features_x_clean is not None and features_x_clean.size(0) > 0:
                     update_counter[0] += 1
+                    if batch_idx % 100 == 0:
+                        print(f'  [Batch {batch_idx}] Updating prototypes...')
                     
                     # 扩展indices匹配features (2N)
                     indices_expanded = torch.cat([indices_x, indices_x], dim=0)
@@ -1171,6 +1182,10 @@ def _scanmix_train_impl(p,epoch,net,net2,optimizer,labeled_trainloader,unlabeled
                             torch.tensor([true_labels_map[idx.item()] for idx in indices_x], device=device),
                             torch.tensor([true_labels_map[idx.item()] for idx in indices_x], device=device)
                         ], dim=0)
+                        
+                        if batch_idx == 0:
+                            print(f'  [Oracle Mode] Using GROUND TRUTH labels for prototype update')
+                            print(f'  [Oracle Mode] Using ALL clean samples (no filtering)')
                         
                         # Oracle模式：传入use_oracle=True跳过过滤
                         prototype_manager.update_prototypes(
@@ -1193,14 +1208,24 @@ def _scanmix_train_impl(p,epoch,net,net2,optimizer,labeled_trainloader,unlabeled
                             use_oracle=False  # 使用标准的拓扑门控和置信度过滤
                         )
                     
+                    if update_counter[0] == 1:
+                        print(f'\n*** FIRST PROTOTYPE UPDATE in Epoch {epoch}! ***')
+                        sys.stdout.flush()
+                elif batch_idx % 100 == 0:
+                    print(f'  [Batch {batch_idx}] Skipping prototype update (no features extracted)')
+        elif prototype_manager is not None and epoch <= p['warmup'] and batch_idx == 0:
+            print(f'  [Warmup] Skipping prototype operations until epoch {p["warmup"]+1}')
+
         labeled_losses.update(Lx.item())
         unlabeled_losses.update(Lu.item())
 
-        if batch_idx % 100 == 0:
+        if batch_idx % 25 == 0:
             progress.display(batch_idx)
     
     if prototype_manager is not None:
-        print(f'  Epoch {epoch}: {update_counter[0]} proto updates, total={prototype_manager.update_count}')
+        print(f'\n*** Epoch {epoch} completed: {update_counter[0]} prototype updates made ***')
+        print(f'*** Prototype manager update_count: {prototype_manager.update_count} ***\n')
+        sys.stdout.flush()
 
 def scanmix_big_train(p,epoch,net,net2,optimizer,labeled_trainloader,unlabeled_trainloader,criterion,lambda_u,device):
     net.train()
@@ -1284,76 +1309,32 @@ def scanmix_big_train(p,epoch,net,net2,optimizer,labeled_trainloader,unlabeled_t
 
         final_loss.update(loss.item())
 
-        if batch_idx % 100 == 0:
+        if batch_idx % 25 == 0:
             progress.display(batch_idx)
 
-def scanmix_warmup(epoch,net,optimizer,dataloader,criterion, conf_penalty, noise_mode, device, lambda_align=0.1, scaler=None):
-    """
-    ScanMix warmup阶段：训练dm_head + 预训练proj_head对齐损失
-    
-    Args:
-        lambda_align: 投影头对齐损失权重（默认0.1）
-            L_align = MSE(normalize(proj_features), normalize(dm_logits.detach()))
-            确保proj_head在warmup阶段学到有意义的表示，为后续原型学习做准备
-        scaler: torch.amp.GradScaler for mixed precision
-    """
+def scanmix_warmup(epoch,net,optimizer,dataloader,criterion, conf_penalty, noise_mode, device):
     net.train()
     losses = AverageMeter('CE-Loss', ':.4e')
-    align_losses = AverageMeter('Align-Loss', ':.4e')
     progress = ProgressMeter(len(dataloader),
-        [losses, align_losses],
+        [losses],
         prefix="Epoch: [{}]".format(epoch))
     num_iter = (len(dataloader.dataset)//dataloader.batch_size)+1
-    for batch_idx, batch in enumerate(dataloader):
-        # 支持字典和元组两种格式
-        if isinstance(batch, dict):
-            inputs = batch['image'].to(device, non_blocking=True)
-            labels = batch['target'].to(device, non_blocking=True)
-            path = batch['meta']['index']
-        else:
-            inputs, labels, path = batch
-            inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
-        
+    for batch_idx, (inputs, labels, path) in enumerate(dataloader):    
+        inputs, labels = inputs.to(device), labels.to(device) 
         optimizer.zero_grad()
-        
-        with torch.amp.autocast('cuda'):
-            # 前向传播：同时获取backbone特征
+        with torch.no_grad():
             input_features = net(inputs, forward_pass='backbone')
-            
-            # DM head损失（dm_head梯度不回传到backbone）
-            with torch.no_grad():
-                input_features_detached = input_features.detach()
-            outputs = net(input_features_detached, forward_pass='dm_head')      
-            loss = criterion(outputs, labels)  
-            if noise_mode=='asym' or 'semantic' in noise_mode:
-                penalty = conf_penalty(outputs)
-                L = loss + penalty      
-            elif noise_mode=='sym':   
-                L = loss
-            
-            # ========== 投影头对齐损失：预训练proj_head ==========
-            # 目标：让proj_head的输出与dm_head的输出方向对齐
-            # 这样在warmup结束后，proj_head已经学到了有意义的类别区分能力
-            if lambda_align > 0 and hasattr(net, 'proj_head'):
-                proj_features = net(input_features.detach(), forward_pass='proj_head')  # detach: warmup阶段不让对齐损失影响backbone
-                proj_norm = F.normalize(proj_features, dim=1)
-                dm_logits_norm = F.normalize(outputs.detach(), dim=1)  # dm_head输出作为目标，detach
-                # 批内相似度结构一致性对齐：两个空间的样本对相似度矩阵应一致
-                sim_proj = torch.mm(proj_norm, proj_norm.t())              # (B, B)
-                sim_dm   = torch.mm(dm_logits_norm, dm_logits_norm.t())    # (B, B)
-                L_align = F.mse_loss(sim_proj, sim_dm.detach())
-                L = L + lambda_align * L_align
-                align_losses.update(L_align.item())
-        
-        if scaler is not None:
-            scaler.scale(L).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            L.backward()  
-            optimizer.step() 
+        outputs = net(input_features, forward_pass='dm_head')      
+        loss = criterion(outputs, labels)  
+        if noise_mode=='asym' or 'semantic' in noise_mode:  # penalize confident prediction for asymmetric noise
+            penalty = conf_penalty(outputs)
+            L = loss + penalty      
+        elif noise_mode=='sym':   
+            L = loss
+        L.backward()  
+        optimizer.step() 
         losses.update(L.item()) 
-        if batch_idx % 100 == 0:
+        if batch_idx % 25 == 0:
             progress.display(batch_idx)
 
 def scanmix_big_warmup(p,epoch,net,optimizer,dataloader,criterion, conf_penalty, noise_mode, device):
@@ -1377,19 +1358,19 @@ def scanmix_big_warmup(p,epoch,net,optimizer,dataloader,criterion, conf_penalty,
         L.backward()  
         optimizer.step() 
         losses.update(L.item()) 
-        if batch_idx % 100 == 0:
+        if batch_idx % 25 == 0:
             progress.display(batch_idx)
 
 def scanmix_eval_train(args,model,all_loss,epoch,eval_loader,criterion,device):    
     model.eval()
     losses = torch.zeros(len(eval_loader.dataset))
     pl = torch.zeros(len(eval_loader.dataset))    
-    with torch.no_grad(), torch.amp.autocast('cuda'):
+    with torch.no_grad():
         for batch_idx, (inputs, targets, index) in enumerate(eval_loader):
-            inputs, targets = inputs.to(device, non_blocking=True), targets.to(device, non_blocking=True) 
+            inputs, targets = inputs.to(device), targets.to(device) 
             outputs = model(inputs, forward_pass='dm')
             _, predicted = torch.max(outputs, 1) 
-            loss = criterion(outputs.float(), targets)  
+            loss = criterion(outputs, targets)  
             for b in range(inputs.size(0)):
                 losses[index[b]]=loss[b]
                 pl[index[b]]  = predicted[b]        
@@ -1429,7 +1410,7 @@ def scanmix_big_eval_train(p,args,model,epoch,eval_loader,criterion,device,outpu
             for b in range(inputs.size(0)):
                 losses[index[b]]=loss[b]
                 pl[index[b]]  = predicted[b]
-            if batch_idx % 100 == 0:
+            if batch_idx % 25 == 0:
                 progress.display(batch_idx)
     losses = (losses-losses.min())/(losses.max()-losses.min())    # normalised losses for each image
     input_loss = losses.reshape(-1,1)
@@ -1448,15 +1429,14 @@ def scanmix_big_eval_train(p,args,model,epoch,eval_loader,criterion,device,outpu
 
 
 def scanmix_scan(train_loader, model, criterion, optimizer, epoch, device, update_cluster_head_only=False, 
-                 neighbor_indices_static=None, neighbor_indices_dynamic=None, neighbor_fusion_alpha=0.8, scaler=None):
+                 neighbor_indices_static=None, neighbor_indices_dynamic=None, neighbor_fusion_alpha=0.8):
     """ 
-    Train w/ SCAN-Loss (支持双源邻居加权融合 + AMP混合精度)
+    Train w/ SCAN-Loss (支持双源邻居加权融合)
     
     Args:
         neighbor_indices_static: 静态邻居库（SimCLR）
         neighbor_indices_dynamic: 动态邻居库（当前模型）
         neighbor_fusion_alpha: 静态邻居权重α，动态邻居权重为(1-α)
-        scaler: torch.amp.GradScaler for mixed precision
     """
     total_losses = AverageMeter('Total Loss', ':.4e')
     consistency_losses = AverageMeter('Consistency Loss', ':.4e')
@@ -1475,34 +1455,28 @@ def scanmix_scan(train_loader, model, criterion, optimizer, epoch, device, updat
         anchors = batch['anchor'].to(device, non_blocking=True)
         neighbors = batch['neighbor'].to(device, non_blocking=True)
        
-        with torch.amp.autocast('cuda'):
-            if update_cluster_head_only: # Only calculate gradient for backprop of linear layer
-                with torch.no_grad():
-                    anchors_features = model(anchors, forward_pass='backbone')
-                    neighbors_features = model(neighbors, forward_pass='backbone')
-                anchors_output = model(anchors_features, forward_pass='sl_head')
-                neighbors_output = model(neighbors_features, forward_pass='sl_head')
+        if update_cluster_head_only: # Only calculate gradient for backprop of linear layer
+            with torch.no_grad():
+                anchors_features = model(anchors, forward_pass='backbone')
+                neighbors_features = model(neighbors, forward_pass='backbone')
+            anchors_output = model(anchors_features, forward_pass='sl_head')
+            neighbors_output = model(neighbors_features, forward_pass='sl_head')
 
-            else: # Calculate gradient for backprop of complete network
-                anchors_output = model(anchors, forward_pass='sl')
-                neighbors_output = model(neighbors, forward_pass='sl')
+        else: # Calculate gradient for backprop of complete network
+            anchors_output = model(anchors, forward_pass='sl')
+            neighbors_output = model(neighbors, forward_pass='sl')     
 
-        # BCELoss is unsafe inside autocast — cast to FP32 before SCANLoss
-        total_loss, consistency_loss, entropy_loss = criterion(anchors_output.float(), neighbors_output.float())
-        
+        # Loss for every head
+        total_loss, consistency_loss, entropy_loss = criterion(anchors_output, neighbors_output)
         # Register the mean loss and backprop the total loss to cover all subheads
         total_losses.update(total_loss.item())
         consistency_losses.update(consistency_loss.item())
         entropy_losses.update(entropy_loss.item())
 
         optimizer.zero_grad()
-        if scaler is not None:
-            scaler.scale(total_loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            total_loss.backward()
-            optimizer.step()
+        total_loss.backward()
+        optimizer.step()
 
-        if i % 100 == 0:
+        if i % 25 == 0:
             progress.display(i)
+        torch.cuda.empty_cache()

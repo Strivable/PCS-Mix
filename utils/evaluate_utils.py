@@ -189,9 +189,9 @@ def scanmix_test(epoch,net1,net2,test_loader,device):
     net2.eval()
     correct = 0
     total = 0
-    with torch.no_grad(), torch.amp.autocast('cuda'):
+    with torch.no_grad():
         for batch_idx, batch in enumerate(test_loader):
-            inputs, targets = batch['image'].to(device, non_blocking=True), batch['target'].to(device, non_blocking=True)
+            inputs, targets = batch['image'].to(device), batch['target'].to(device)
             outputs1 = net1(inputs, forward_pass='dm')
             outputs2 = net2(inputs, forward_pass='dm')           
             outputs = outputs1+outputs2

@@ -99,8 +99,7 @@ def get_model(p, pretrain_path=None):
     
     elif p['setup'] in ['scanmix', 'dividemix']:
         from models.models import ScanMixModel
-        proj_dim = p.get('proj_dim', 128)  # 投影头维度，默认128
-        model = ScanMixModel(backbone, p['num_classes'], p['num_heads'], p['setup'], proj_dim=proj_dim)
+        model = ScanMixModel(backbone, p['num_classes'], p['num_heads'], p['setup'])
 
     else:
         raise ValueError('Invalid setup {}'.format(p['setup']))
@@ -146,9 +145,7 @@ def get_model(p, pretrain_path=None):
             model_state['dm_head.bias'] = best_head_bias
             model_state['sl_head.weight'] = best_head_weight
             model_state['sl_head.bias'] = best_head_bias
-            missing = model.load_state_dict(copy.deepcopy(model_state), strict=False)
-            if missing.missing_keys:
-                print(f'  [ScanMix] Missing keys in pretrained weights (randomly initialized): {missing.missing_keys}')
+            missing = model.load_state_dict(copy.deepcopy(model_state), strict=True)
 
         else:
             raise NotImplementedError
@@ -282,17 +279,13 @@ def get_train_dataloader(p, dataset, shuffle=True, explicit_batch_size=None):
         batch_size = explicit_batch_size
     return torch.utils.data.DataLoader(dataset, num_workers=p['num_workers'], 
             batch_size=batch_size, pin_memory=True, collate_fn=collate_custom,
-            drop_last=True, shuffle=shuffle,
-            persistent_workers=True if p['num_workers'] > 0 else False,
-            prefetch_factor=4 if p['num_workers'] > 0 else None)
+            drop_last=True, shuffle=shuffle)
 
 
 def get_val_dataloader(p, dataset):
     return torch.utils.data.DataLoader(dataset, num_workers=p['num_workers'],
             batch_size=p['batch_size'], pin_memory=True, collate_fn=collate_custom,
-            drop_last=False, shuffle=False,
-            persistent_workers=True if p['num_workers'] > 0 else False,
-            prefetch_factor=4 if p['num_workers'] > 0 else None)
+            drop_last=False, shuffle=False)
 
 
 def get_train_transformations(p):
