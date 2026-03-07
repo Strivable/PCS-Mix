@@ -1,0 +1,78 @@
+# setup
+setup: scanmix
+data_path: ../noisy_label/datasets/cifar-10
+train_db_name: cifar-10
+val_db_name: cifar-10
+dataset: cifar10
+noise_dir: ./noise
+plots_dir: plots
+to_noisy_dataset: True
+
+# Loss
+criterion: scanmix
+criterion_kwargs:
+   entropy_weight: 5.0
+
+# Hyperparameters
+num_epochs: 300
+epochs: 300
+alpha: 4
+batch_size: 64
+batch_size_scan: 128
+p_threshold: 0.5
+T: 0.5
+num_class: 10
+num_classes: 10
+warmup: 10
+num_workers: 8
+update_cluster_head_only: False
+num_neighbors: 20
+
+# Prototype Learning Parameters
+proj_dim: 128                  # 投影头输出维度（解耦原型对比损失与MixUp梯度）
+prototype_alpha_low: 0.9       # 动量更新系数 for 低噪声 (<=40%)
+prototype_alpha_medium: 0.95   # 动量更新系数 for 中等噪声 (40-70%)
+prototype_alpha_high: 0.99     # 动量更新系数 for 高噪声 (>70%)
+prototype_queue_size: 64       # 动量队列大小
+
+# Prototype Contrastive Loss Weight (lambda_proto)
+lambda_proto_low_start: 0.5    # 低噪声模式起始权重
+lambda_proto_low_end: 1.0      # 低噪声模式最终权重
+lambda_proto_low_rampup: 30    # 低噪声模式增长轮数
+lambda_proto_medium: 0.5       # 中等噪声模式固定权重
+lambda_proto_high: 0.2         # 高噪声模式固定权重
+
+# Neighbor Fusion Parameters
+neighbor_fusion_alpha_early: 1.0   # 早期训练阶段邻居融合权重 (静态邻居权重)
+neighbor_fusion_alpha_late: 0.8    # 后期训练阶段邻居融合权重 (静态邻居权重)
+neighbor_fusion_switch_epoch: 100  # 切换轮次
+
+# Transformations
+augmentation_strategy: ours 
+augmentation_kwargs:
+   crop_size: 32
+   crop_padding: 4
+   normalize:
+      mean: [0.4914, 0.4822, 0.4465]
+      std: [0.2023, 0.1994, 0.2010]
+   num_strong_augs: 4
+   cutout_kwargs:
+     n_holes: 1
+     length: 16
+     random: True
+
+lr: 0.02
+lr_sl: 0.0001
+#optimisers
+optimizer: sgd
+optimizer_kwargs:
+  lr: 0.02
+  momentum: 0.9
+  weight_decay: 0.0005
+
+#model
+backbone: resnet18
+num_heads: 2
+
+# Scheduler
+scheduler: constant

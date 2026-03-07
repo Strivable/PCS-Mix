@@ -1,0 +1,81 @@
+# setup
+setup: scanmix
+data_path: F:/dataset-industry/NEU-CLS
+train_db_name: neucls
+val_db_name: neucls
+dataset: neucls
+noise_dir: ./noise/neucls  # 噪声标签文件保存目录
+plots_dir: plots
+to_noisy_dataset: True
+
+# Loss
+criterion: scanmix
+criterion_kwargs:
+   entropy_weight: 5.0
+
+# Hyperparameters
+num_epochs: 300
+epochs: 300
+alpha: 4
+batch_size: 16  # 减小batch size避免显存不足 (从32->16)
+batch_size_scan: 32  # 减小scan batch size (从64->32)
+p_threshold: 0.5
+T: 0.5
+num_class: 6  # NEU-CLS有6个类别
+num_classes: 6
+warmup: 10  # warmup轮数
+num_workers: 4
+update_cluster_head_only: False
+num_neighbors: 20
+
+# Prototype Learning Parameters
+# 工业数据集特点：类内差异大，类间相似度高
+proj_dim: 128                  # 投影头输出维度（解耦原型对比损失与MixUp梯度）
+prototype_alpha_low: 0.85      # 低噪声：更快适应 (<=40%)
+prototype_alpha_medium: 0.92   # 中等噪声 (40-70%)
+prototype_alpha_high: 0.98     # 高噪声：更保守 (>70%)
+prototype_queue_size: 32       # 小数据集使用较小队列
+
+# Prototype Contrastive Loss Weight (lambda_proto)
+lambda_proto_low_start: 0.3    # 低噪声起始权重（工业数据较难，降低起始权重）
+lambda_proto_low_end: 0.8      # 低噪声最终权重
+lambda_proto_low_rampup: 30    # 增长轮数
+lambda_proto_medium: 0.4       # 中等噪声权重
+lambda_proto_high: 0.15        # 高噪声权重（降低以避免原型污染）
+
+# Neighbor Fusion Parameters
+neighbor_fusion_alpha_early: 1.0   # 早期只用静态邻居（稳定）
+neighbor_fusion_alpha_late: 0.85   # 后期逐渐融入动态邻居
+neighbor_fusion_switch_epoch: 80   # 小数据集更早切换
+
+# Transformations
+# 工业缺陷数据集的数据增强策略
+augmentation_strategy: ours 
+augmentation_kwargs:
+   crop_size: 200  # NEU-CLS图片尺寸
+   crop_padding: 20  # 适度padding
+   normalize:
+      mean: [0.485, 0.456, 0.406]
+      std: [0.229, 0.224, 0.225]
+   num_strong_augs: 4
+   cutout_kwargs:
+     n_holes: 1
+     length: 40  # 根据图片尺寸调整cutout大小
+     random: True
+
+lr: 0.01  # 小数据集降低学习率
+lr_sl: 0.00005  # SCAN学习率也相应降低
+
+# Optimizers
+optimizer: sgd
+optimizer_kwargs:
+  lr: 0.01
+  momentum: 0.9
+  weight_decay: 0.001  # 小数据集增加正则化
+
+# Model
+backbone: resnet18
+num_heads: 2
+
+# Scheduler
+scheduler: constant

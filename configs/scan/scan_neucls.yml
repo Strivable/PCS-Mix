@@ -1,0 +1,54 @@
+# setup
+setup: scan
+data_path: F:/dataset-industry/NEU-CLS
+to_noisy_dataset: False # labels are not used in SCAN
+dataset: neucls
+
+# Loss
+criterion: scan
+criterion_kwargs:
+   entropy_weight: 5.0
+
+# Weight update
+update_cluster_head_only: False # Update full network in SCAN
+num_heads: 1 # Only use one head
+
+# Model
+backbone: resnet18
+
+# Dataset
+train_db_name: neucls
+val_db_name: neucls
+num_classes: 6  # NEU-CLS has 6 classes
+num_neighbors: 20
+
+# Transformations
+augmentation_strategy: ours 
+augmentation_kwargs:
+   crop_size: 200  # NEU-CLS image size is 200x200
+   normalize:
+      mean: [0.485, 0.456, 0.406]  # ImageNet pretrained stats
+      std: [0.229, 0.224, 0.225]
+   num_strong_augs: 4
+   cutout_kwargs:
+     n_holes: 1
+     length: 50  # Adjusted for 200x200 images
+     random: True
+
+transformation_kwargs:
+   crop_size: 200
+   normalize:
+      mean: [0.485, 0.456, 0.406]
+      std: [0.229, 0.224, 0.225]
+
+# Hyperparameters
+optimizer: adam
+optimizer_kwargs:
+   lr: 0.0001
+   weight_decay: 0.0001
+epochs: 100  # Reduced for small dataset (NEU-CLS has only 1440 training images)
+batch_size: 64  # Smaller batch size for small dataset
+num_workers: 4
+
+# Scheduler
+scheduler: constant
